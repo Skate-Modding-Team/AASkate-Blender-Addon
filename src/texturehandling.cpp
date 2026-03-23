@@ -1,0 +1,1349 @@
+﻿// made by tuukkas 2023-24
+
+#include "texturehandling.h"
+#include "DDS.h"
+#include <vector>
+#include <cassert>
+#include <iostream>
+#include <fstream>
+#include <dirent.h>
+#include <unordered_map>
+#include <bitset>
+
+static bool operator==(const DirectX::DDS_PIXELFORMAT& lhs, const DirectX::DDS_PIXELFORMAT& rhs) {
+    return lhs.size == rhs.size &&
+        lhs.flags == rhs.flags &&
+        lhs.fourCC == rhs.fourCC &&
+        lhs.RGBBitCount == rhs.RGBBitCount &&
+        lhs.RBitMask == rhs.RBitMask &&
+        lhs.GBitMask == rhs.GBitMask &&
+        lhs.BBitMask == rhs.BBitMask &&
+        lhs.ABitMask == rhs.ABitMask;
+}
+
+std::string GetDXTEXTUREFORMATName(const DirectX::DDS_PIXELFORMAT& format) {
+    if (format == DirectX::DDSPF_DXT1) return "GPUTEXTUREFORMAT_DXT1";
+    if (format == DirectX::DDSPF_DXT2) return "GPUTEXTUREFORMAT_DXT2_3";
+    if (format == DirectX::DDSPF_DXT3) return "GPUTEXTUREFORMAT_DXT2_3";
+    if (format == DirectX::DDSPF_DXT4) return "GPUTEXTUREFORMAT_DXT4_5";
+    if (format == DirectX::DDSPF_DXT5) return "GPUTEXTUREFORMAT_DXT4_5";
+    if (format == DirectX::DDSPF_BC5_SNORM) return "GPUTEXTUREFORMAT_DXN";
+    if (format == DirectX::DDSPF_A8R8G8B8) return "GPUTEXTUREFORMAT_8_8_8_8";
+    if (format == DirectX::DDSPF_R5G6B5) return "GPUTEXTUREFORMAT_5_6_5";
+    if (format == DirectX::DDSPF_A8) return "GPUTEXTUREFORMAT_8";
+    // Add more entries as needed
+    return "Unknown format";
+}
+
+const std::unordered_map<uint32_t, DirectX::DDS_PIXELFORMAT> pixelFormatsPS3 = {
+    {0x85, DirectX::DDSPF_A8R8G8B8},
+    {0x86, DirectX::DDSPF_DXT1},
+    {0x87, DirectX::DDSPF_DXT3},
+    {0x88, DirectX::DDSPF_DXT5},
+    {0xA5, DirectX::DDSPF_A8R8G8B8},
+    {0x81, DirectX::DDSPF_DXT1},
+    // Add more entries as needed
+};
+
+void printBinary(DWORD value) {
+    std::bitset<32> bits(value);
+    std::cout << bits << std::endl;
+}
+
+unsigned int reverseBits(unsigned int value) {
+    unsigned int result = 0;
+    for (int i = 0; i < 32; ++i) {
+        result = (result << 1) | (value & 1);
+        value >>= 1;
+    }
+    return result;
+}
+
+unsigned int reverseBytes(unsigned int value) {
+    return ((value & 0xFF) << 24) | (((value >> 8) & 0xFF) << 16) | (((value >> 16) & 0xFF) << 8) | ((value >> 24) & 0xFF);
+}
+
+void reverseBytesInArray(unsigned char* array, size_t size) {
+    for (size_t i = 0; i < size; i += 4) {
+        uint32_t* value = reinterpret_cast<uint32_t*>(&array[i]);
+        *value = reverseBytes(*value);
+        *value = reverseBits(*value);
+    }
+}
+
+void printBinaryArray(unsigned char* array, size_t size) {
+    for (size_t i = 0; i < size; i += 4) {
+        uint32_t* value = reinterpret_cast<uint32_t*>(&array[i]);
+        printBinary(*value);
+    }
+}
+
+int breverse(int num, int numBits) {
+    int result = 0;
+    for (int i = 0; i < numBits; ++i) {
+        result = (result << 1) | (num & 1);
+        num >>= 1;
+    }
+    return result;
+}
+
+int extractDwordValue(uint32_t dwordValue, int size, int offset) {
+    // Ensure mask handles all bit sizes correctly without overflow
+    uint32_t mask = (size == 32) ? 0xFFFFFFFF : ((1u << size) - 1);
+
+    // Shift right by the offset, then apply the mask to extract the bit field
+    return (dwordValue >> offset) & mask;
+}
+
+int extractValue(unsigned char* GPUTEXTURE_FETCH_CONSTANT, int size, int offset) {
+    DWORD dwordValue = *(reinterpret_cast<const DWORD*>(GPUTEXTURE_FETCH_CONSTANT));
+    std::cout << std::hex << dwordValue << "\n";
+    return breverse(extractDwordValue(dwordValue, size, offset), size);
+}
+
+DWORD XGAddress2DTiledOffset(DWORD x, DWORD y, DWORD w, DWORD texelPitch)
+{
+    DWORD alignedWidth = (w + 31) & ~31;
+    DWORD logBpp = (texelPitch >> 2) + ((texelPitch >> 1) >> (texelPitch >> 2));
+    DWORD Macro = (((x >> 5) + (y >> 5) * (alignedWidth >> 5)) << (logBpp + 7));
+    DWORD Micro = (((x & 7) + ((y & 6) << 2)) << logBpp);
+    DWORD Offset = Macro + ((Micro & ~15) << 1) + (Micro & 15) + ((y & 8) << (3 + logBpp)) + ((y & 1) << 4);
+
+    return ((((Offset & ~511) << 3) + ((Offset & 448) << 2) + (Offset & 63) + ((y & 16) << 7) + (((((y & 8) >> 2) + (x >> 3)) & 3) << 6)) >> logBpp);
+}
+
+std::string GetGPUENDIAN(DWORD dwEndian)
+{
+    switch (dwEndian)
+    {
+    case 0:
+        return "GPUENDIAN_NONE";
+    case 1:
+        return "GPUENDIAN_8IN16";
+    case 2:
+        return "GPUENDIAN_8IN32";
+    case 3:
+        return "GPUENDIAN_16IN32";
+    default:
+        return "-invalid-endian-";
+    }
+}
+
+DirectX::DDS_PIXELFORMAT GetDDSTEXTUREFORMAT(DWORD dwTextureType)
+{
+    switch (dwTextureType)
+    {
+    case 0: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_1_REVERSE";
+    case 1: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_1";
+    case 2: return DirectX::DDSPF_A8;
+    case 3: return DirectX::DDSPF_A1R5G5B5;
+    case 4: return DirectX::DDSPF_R5G6B5;
+    case 5: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_6_5_5";
+    case 6: return DirectX::DDSPF_A8R8G8B8;
+    case 7: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_2_10_10_10";
+    case 8: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_8_A";
+    case 9: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_8_B";
+    case 10: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_8_8";
+    case 11: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_Cr_Y1_Cb_Y0_REP";
+    case 12: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_Y1_Cr_Y0_Cb_REP";
+    case 13: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_EDRAM";
+    case 14: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_8_8_8_8_A";
+    case 15: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_4_4_4_4";
+    case 16: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_10_11_11";
+    case 17: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_11_11_10";
+    case 18: return DirectX::DDSPF_DXT1;
+    case 19: return DirectX::DDSPF_DXT3;
+    case 20: return DirectX::DDSPF_DXT5;
+    case 21: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_16_16_EDRAM";
+    case 22: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_24_8";
+    case 23: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_24_8_FLOAT";
+    case 24: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16";
+    case 25: return DirectX::DDSPF_G16R16; //16_16
+    case 26: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_16_16";
+    case 27: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_EXPAND";
+    case 28: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_EXPAND";
+    case 29: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_16_16_EXPAND";
+    case 30: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_FLOAT";
+    case 31: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_FLOAT";
+    case 32: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_16_16_FLOAT";
+    case 33: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32";
+    case 34: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_32";
+    case 35: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_32_32_32";
+    case 36: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_FLOAT";
+    case 37: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_32_FLOAT";
+    case 38: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_32_32_32_FLOAT";
+    case 39: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_AS_8";
+    case 40: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_AS_8_8";
+    case 41: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_MPEG";
+    case 42: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_MPEG";
+    case 43: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_8_INTERLACED";
+    case 44: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_AS_8_INTERLACED";
+    case 45: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_AS_8_8_INTERLACED";
+    case 46: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_INTERLACED";
+    case 47: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_MPEG_INTERLACED";
+    case 48: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_16_16_MPEG_INTERLACED";
+    case 49: return DirectX::DDSPF_BC5_SNORM; //DXN
+    case 50: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_8_8_8_8_AS_16_16_16_16";
+    case 51: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_DXT1_AS_16_16_16_16";
+    case 52: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_DXT2_3_AS_16_16_16_16";
+    case 53: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_DXT4_5_AS_16_16_16_16";
+    case 54: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_2_10_10_10_AS_16_16_16_16";
+    case 55: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_10_11_11_AS_16_16_16_16";
+    case 56: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_11_11_10_AS_16_16_16_16";
+    case 57: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_32_32_32_FLOAT";
+    case 58: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_DXT3A";
+    case 59: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_DXT5A";
+    case 60: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_CTX1";
+    case 61: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_DXT3A_AS_1_1_1_1";
+    case 62: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_8_8_8_8_GAMMA_EDRAM";
+    case 63: return DirectX::DDSPF_A8R8G8B8; //"GPUTEXTUREFORMAT_2_10_10_10_FLOAT_EDRAM";
+    default: return DirectX::DDSPF_A8R8G8B8; //"-unknown-";
+    // Modify this as needed
+    ;}
+}
+
+std::string GetGPUTEXTUREFORMAT(DWORD dwTextureType)
+{
+    switch (dwTextureType)
+    {
+    case 0: return "GPUTEXTUREFORMAT_1_REVERSE";
+    case 1: return "GPUTEXTUREFORMAT_1";
+    case 2: return "GPUTEXTUREFORMAT_8";
+    case 3: return "GPUTEXTUREFORMAT_1_5_5_5";
+    case 4: return "GPUTEXTUREFORMAT_5_6_5";
+    case 5: return "GPUTEXTUREFORMAT_6_5_5";
+    case 6: return "GPUTEXTUREFORMAT_8_8_8_8";
+    case 7: return "GPUTEXTUREFORMAT_2_10_10_10";
+    case 8: return "GPUTEXTUREFORMAT_8_A";
+    case 9: return "GPUTEXTUREFORMAT_8_B";
+    case 10: return "GPUTEXTUREFORMAT_8_8";
+    case 11: return "GPUTEXTUREFORMAT_Cr_Y1_Cb_Y0_REP";
+    case 12: return "GPUTEXTUREFORMAT_Y1_Cr_Y0_Cb_REP";
+    case 13: return "GPUTEXTUREFORMAT_16_16_EDRAM";
+    case 14: return "GPUTEXTUREFORMAT_8_8_8_8_A";
+    case 15: return "GPUTEXTUREFORMAT_4_4_4_4";
+    case 16: return "GPUTEXTUREFORMAT_10_11_11";
+    case 17: return "GPUTEXTUREFORMAT_11_11_10";
+    case 18: return "GPUTEXTUREFORMAT_DXT1";
+    case 19: return "GPUTEXTUREFORMAT_DXT2_3";
+    case 20: return "GPUTEXTUREFORMAT_DXT4_5";
+    case 21: return "GPUTEXTUREFORMAT_16_16_16_16_EDRAM";
+    case 22: return "GPUTEXTUREFORMAT_24_8";
+    case 23: return "GPUTEXTUREFORMAT_24_8_FLOAT";
+    case 24: return "GPUTEXTUREFORMAT_16";
+    case 25: return "GPUTEXTUREFORMAT_16_16";
+    case 26: return "GPUTEXTUREFORMAT_16_16_16_16";
+    case 27: return "GPUTEXTUREFORMAT_16_EXPAND";
+    case 28: return "GPUTEXTUREFORMAT_16_16_EXPAND";
+    case 29: return "GPUTEXTUREFORMAT_16_16_16_16_EXPAND";
+    case 30: return "GPUTEXTUREFORMAT_16_FLOAT";
+    case 31: return "GPUTEXTUREFORMAT_16_16_FLOAT";
+    case 32: return "GPUTEXTUREFORMAT_16_16_16_16_FLOAT";
+    case 33: return "GPUTEXTUREFORMAT_32";
+    case 34: return "GPUTEXTUREFORMAT_32_32";
+    case 35: return "GPUTEXTUREFORMAT_32_32_32_32";
+    case 36: return "GPUTEXTUREFORMAT_32_FLOAT";
+    case 37: return "GPUTEXTUREFORMAT_32_32_FLOAT";
+    case 38: return "GPUTEXTUREFORMAT_32_32_32_32_FLOAT";
+    case 39: return "GPUTEXTUREFORMAT_32_AS_8";
+    case 40: return "GPUTEXTUREFORMAT_32_AS_8_8";
+    case 41: return "GPUTEXTUREFORMAT_16_MPEG";
+    case 42: return "GPUTEXTUREFORMAT_16_16_MPEG";
+    case 43: return "GPUTEXTUREFORMAT_8_INTERLACED";
+    case 44: return "GPUTEXTUREFORMAT_32_AS_8_INTERLACED";
+    case 45: return "GPUTEXTUREFORMAT_32_AS_8_8_INTERLACED";
+    case 46: return "GPUTEXTUREFORMAT_16_INTERLACED";
+    case 47: return "GPUTEXTUREFORMAT_16_MPEG_INTERLACED";
+    case 48: return "GPUTEXTUREFORMAT_16_16_MPEG_INTERLACED";
+    case 49: return "GPUTEXTUREFORMAT_DXN";
+    case 50: return "GPUTEXTUREFORMAT_8_8_8_8_AS_16_16_16_16";
+    case 51: return "GPUTEXTUREFORMAT_DXT1_AS_16_16_16_16";
+    case 52: return "GPUTEXTUREFORMAT_DXT2_3_AS_16_16_16_16";
+    case 53: return "GPUTEXTUREFORMAT_DXT4_5_AS_16_16_16_16";
+    case 54: return "GPUTEXTUREFORMAT_2_10_10_10_AS_16_16_16_16";
+    case 55: return "GPUTEXTUREFORMAT_10_11_11_AS_16_16_16_16";
+    case 56: return "GPUTEXTUREFORMAT_11_11_10_AS_16_16_16_16";
+    case 57: return "GPUTEXTUREFORMAT_32_32_32_FLOAT";
+    case 58: return "GPUTEXTUREFORMAT_DXT3A";
+    case 59: return "GPUTEXTUREFORMAT_DXT5A";
+    case 60: return "GPUTEXTUREFORMAT_CTX1";
+    case 61: return "GPUTEXTUREFORMAT_DXT3A_AS_1_1_1_1";
+    case 62: return "GPUTEXTUREFORMAT_8_8_8_8_GAMMA_EDRAM";
+    case 63: return "GPUTEXTUREFORMAT_2_10_10_10_FLOAT_EDRAM";
+    default: return "-unknown-";
+    }
+}
+
+void GetTextureFormatProperties(const std::string& gpuFormat,
+    int& blockSize,
+    int& texelPitch,
+    bool& compressed) {
+
+    // Determine properties based on gpuFormat
+    if (gpuFormat == "GPUTEXTUREFORMAT_DXT1") { // DXT1
+        blockSize = 4;
+        compressed = true;
+        texelPitch = 8;
+    }
+    else if (gpuFormat == "GPUTEXTUREFORMAT_DXT2_3" ||
+        gpuFormat == "GPUTEXTUREFORMAT_DXT4_5" ||
+        gpuFormat == "GPUTEXTUREFORMAT_DXN") { // DXT3, DXT5, DXN
+        blockSize = 4;
+        compressed = true;
+        texelPitch = 16;
+    }
+    else if (gpuFormat == "GPUTEXTUREFORMAT_8_8_8_8") { // A8R8G8B8
+        blockSize = 1;
+        compressed = false;
+        texelPitch = 4;
+    }
+    else if (gpuFormat == "GPUTEXTUREFORMAT_5_6_5") { // R5G6B5
+        blockSize = 1;
+        compressed = false;
+        texelPitch = 2;
+    }
+    else if (gpuFormat == "GPUTEXTUREFORMAT_8") { // A8
+        blockSize = 1;
+        compressed = false;
+        texelPitch = 1;
+    }
+    // Add more entries as needed
+}
+
+void swapEndianArray(std::vector<unsigned char>& data, size_t elementSize)
+{
+    size_t dataSize = data.size();
+    if (dataSize % elementSize != 0)
+        return;
+
+    size_t numElements = dataSize / elementSize;
+    unsigned char* pData = data.data();
+    for (size_t i = 0; i < numElements; i++)
+    {
+        unsigned char* pElement = pData + i * elementSize;
+        for (size_t j = 0; j < elementSize / 2; j++)
+        {
+            std::swap(pElement[j], pElement[elementSize - 1 - j]);
+        }
+    }
+}
+
+template<class T> inline T Align(const T ptr, int alignment)
+{
+    return (T)(((size_t)ptr + alignment - 1) & ~(alignment - 1));
+}
+
+inline int appLog2(int n)
+{
+    int r;
+    for (r = -1; n; n >>= 1, r++)
+    { /*empty*/
+    }
+    return r;
+}
+
+static unsigned GetXbox360TiledOffset(int x, int y, int width, int logBpb)
+{
+    assert(width <= 8192);
+
+    int alignedWidth = Align(width, 32);
+    // top bits of coordinates
+    int macro = ((x >> 5) + (y >> 5) * (alignedWidth >> 5)) << (logBpb + 7);
+    // lower bits of coordinates (result is 6-bit value)
+    int micro = ((x & 7) + ((y & 0xE) << 2)) << logBpb;
+    // mix micro/macro + add few remaining x/y bits
+    int offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+    // mix bits again
+    return (((offset & ~0x1FF) << 3) +				// upper bits (offset bits [*-9])
+        ((y & 16) << 7) +							// next 1 bit
+        ((offset & 0x1C0) << 2) +					// next 3 bits (offset bits [8-6])
+        (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) +	// next 2 bits
+        (offset & 0x3F)								// lower 6 bits (offset bits [5-0])
+        ) >> logBpb;
+}
+
+std::vector<uint8_t> UntileCompressedXbox360Texture(const std::vector<uint8_t>& src,
+    int tiledBlockWidth, int originalBlockWidth,
+    int tiledBlockHeight, int originalBlockHeight, int texelPitch, int sxOffset, int syOffset) {
+
+    std::vector<uint8_t> dst(static_cast<size_t>(originalBlockHeight) * static_cast<size_t>(originalBlockWidth) + static_cast<size_t>(originalBlockWidth) * static_cast<size_t>(texelPitch) * 2);
+    const int logBpp = appLog2(texelPitch);
+    const int numImageBlocks = static_cast<size_t>(tiledBlockWidth * tiledBlockHeight);
+
+    for (int dy = 0; dy < originalBlockHeight; dy++) {
+        for (int dx = 0; dx < originalBlockWidth; dx++) {
+            unsigned swzAddr = GetXbox360TiledOffset(dx + sxOffset, dy + syOffset, tiledBlockWidth, logBpp);
+            
+            int sy = swzAddr / tiledBlockWidth;
+            int sx = swzAddr % tiledBlockWidth;
+
+            size_t srcIndex = (static_cast<size_t>(sy) * static_cast<size_t>(tiledBlockWidth) + static_cast<size_t>(sx)) * static_cast<size_t>(texelPitch);
+            size_t dstIndex = (static_cast<size_t>(dy) * static_cast<size_t>(originalBlockWidth) + static_cast<size_t>(dx)) * static_cast<size_t>(texelPitch);
+
+            // Emplace back the elements into the vector
+            dst.insert(dst.begin() + dstIndex, src.begin() + srcIndex, src.begin() + srcIndex + texelPitch);
+        }
+    }
+
+    return dst;
+}
+
+void UntileSurface(LPPOINT point, uint32_t width, uint8_t* destination, uint32_t rowPitch, uint8_t* source, uint32_t height, LPRECT rect, uint32_t texelPitch)
+{
+    // Use stack-based defaults if parameters are NULL
+    tagRECT l_localRect;
+    tagPOINT l_localPoint;
+    LPRECT l_rect = rect;
+
+    // Create default rectangle if none provided
+    if (!rect)
+    {
+        l_localRect.left = 0;
+        l_localRect.top = 0;
+        l_localRect.right = width;
+        l_localRect.bottom = height;
+        l_rect = &l_localRect;
+    }
+
+    // Calculate rectangle dimensions
+    uint32_t l_rectWidth = l_rect->right - l_rect->left;
+    uint32_t l_rectHeight = l_rect->bottom - l_rect->top;
+
+    // Create default point if none provided
+    if (!point)
+    {
+        l_localPoint.x = 0;
+        l_localPoint.y = 0;
+        point = &l_localPoint;
+    }
+
+    // Calculate aligned width (round up to nearest multiple of 32)
+    uint32_t l_alignedWidth = (width + 31) & 0xFFFFFFE0;
+
+    // Prepare source data - make a copy if source and destination are the same
+    void* l_sourceData;
+    if (source == destination)
+    {
+        // Calculate size needed for the buffer (aligned to 4KB boundary)
+        uint32_t l_alignSize = (texelPitch * l_alignedWidth * ((height + 31) & 0xFFFFFFE0) + 4095) & 0xFFFFF000;
+        l_sourceData = _aligned_malloc(l_alignSize, 16u);
+        memcpy((uint8_t*)l_sourceData, source, l_alignSize);
+    }
+    else
+    {
+        l_sourceData = source;
+    }
+
+    // Calculate block size and shift based on texel pitch
+    uint32_t l_blockSize = 1 << ((texelPitch >> 4) - (texelPitch >> 2) + 3);
+    uint32_t l_blockShift = (texelPitch >> 2) + (texelPitch >> 1 >> (texelPitch >> 2));
+
+    // Calculate block alignment values
+    int l_rectLeft = l_rect->left;
+    uint32_t l_blockStartOffset = (~(l_blockSize - 1) & (l_rect->left + l_blockSize)) - l_rect->left;
+    int l_rightEdgeOffset = (~(l_blockSize - 1) & (l_rectLeft + l_rectWidth)) - l_rectLeft;
+
+    // Limit initial block width if it exceeds total width
+    uint32_t l_leftBlockWidth = l_blockStartOffset;
+    if (l_leftBlockWidth > l_rectWidth)
+        l_leftBlockWidth = l_rectWidth;
+
+    uint32_t l_bytesPerRow = l_leftBlockWidth << l_blockShift;
+
+    // Process each row of the rectangle
+    if (l_rectHeight)
+    {
+        uint32_t l_blockCountX = l_alignedWidth >> 5;
+
+        for (uint32_t l_yOffset = 0; l_yOffset < l_rectHeight; l_yOffset++)
+        {
+            uint32_t l_y = l_yOffset + l_rect->top;
+            uint32_t l_blockRowOffset = l_blockCountX * (l_y >> 5);
+            uint32_t l_yBit4 = (l_y >> 4) & 1;
+            uint32_t l_yBit3 = (l_y >> 3) & 1;
+            uint32_t l_yBit0Offset = 16 * (l_y & 1);
+            uint32_t l_yBits1_2Offset = 4 * (l_y & 6);
+            uint32_t l_yBit3Offset = 2 * l_yBit3;
+            uint32_t l_xPos = l_rect->left;
+            uint32_t l_xOffsetBits = l_yBits1_2Offset + (l_rect->left & 7);
+            uint32_t l_yBit3ShiftedOffset = l_yBit3 << (l_blockShift + 6);
+
+            // Calculate destination row offset
+            uint32_t l_rowOffset = rowPitch * (l_yOffset + point->y);
+
+            // Calculate swizzled address components for this block
+            uint32_t l_swizzledOffset = l_yBit0Offset + l_yBit3ShiftedOffset +
+                ((l_xOffsetBits << (l_blockShift + 6) >> 6) & 0xF) +
+                2 * (((l_xOffsetBits << (l_blockShift + 6) >> 6) & 0xFFFFFFF0) +
+                    (((l_blockRowOffset + (l_xPos >> 5)) << (l_blockShift + 6)) & 0x1FFFFFFF));
+
+            // Copy first block (may be partial)
+            memcpy(&destination[(point->x << l_blockShift) + l_rowOffset],
+                (uint8_t*)l_sourceData +
+                2048 * (((uint8_t)l_yBit4 + 2 * (((uint8_t)l_yBit3Offset + (uint8_t)(l_xPos >> 3)) & 3)) & 1) +
+                256 * ((l_swizzledOffset >> 6) & 7) +
+                32 * ((l_yBit4 + 2 * (((uint8_t)l_yBit3Offset + (uint8_t)(l_xPos >> 3)) & 3)) & 0xFFFFFFFE) +
+                8 * (l_swizzledOffset & 0xFFFFFE00) +
+                (l_swizzledOffset & 0x3F),
+                l_bytesPerRow);
+
+            // Process full blocks in the middle
+            uint32_t l_currentXOffset = l_blockStartOffset;
+            if ((int)l_blockStartOffset < l_rightEdgeOffset)
+            {
+                uint32_t l_blockBytes = l_blockSize << l_blockShift;
+
+                do
+                {
+                    uint32_t l_middleXPos = l_currentXOffset + l_rect->left;
+                    uint32_t l_middleXOffsetBits = (l_yBits1_2Offset + (l_middleXPos & 7)) << (l_blockShift + 6);
+
+                    uint32_t l_middleSwizzledOffset = l_yBit0Offset + l_yBit3ShiftedOffset +
+                        ((l_middleXOffsetBits >> 6) & 0xF) +
+                        2 * (((l_middleXOffsetBits >> 6) & 0xFFFFFFF0) +
+                            (((l_blockRowOffset + (l_middleXPos >> 5)) << (l_blockShift + 6)) & 0x1FFFFFFF));
+
+                    uint32_t l_middleYOffset = l_yBit4 + 2 * (((uint8_t)l_yBit3Offset + (uint8_t)(l_middleXPos >> 3)) & 3);
+
+                    memcpy(&destination[((l_currentXOffset + point->x) << l_blockShift) + l_rowOffset],
+                        (uint8_t*)l_sourceData +
+                        256 * (((l_middleSwizzledOffset >> 6) & 7) + 8 * (((uint8_t)l_yBit4 + 2 * (((uint8_t)l_yBit3Offset + (uint8_t)(l_middleXPos >> 3)) & 3)) & 1)) +
+                        32 * (l_middleYOffset & 0xFFFFFFFE) +
+                        8 * (l_middleSwizzledOffset & 0xFFFFFE00) +
+                        (l_middleSwizzledOffset & 0x3F),
+                        l_blockBytes);
+
+                    l_currentXOffset += l_blockSize;
+                } while (l_currentXOffset < l_rightEdgeOffset);
+            }
+
+            // Process the rightmost partial block if needed
+            if (l_currentXOffset < l_rectWidth)
+            {
+                uint32_t l_rightXPos = l_currentXOffset + l_rect->left;
+                uint32_t l_rightYOffset = l_yBit4 + 2 * (((uint8_t)l_yBit3Offset + (uint8_t)(l_rightXPos >> 3)) & 3);
+                uint32_t l_rightXOffsetBits = (l_yBits1_2Offset + (l_rightXPos & 7)) << (l_blockShift + 6);
+
+                uint32_t l_rightSwizzledOffset = l_yBit0Offset + l_yBit3ShiftedOffset +
+                    ((l_rightXOffsetBits >> 6) & 0xF) +
+                    2 * (((l_rightXOffsetBits >> 6) & 0xFFFFFFF0) +
+                        (((l_blockRowOffset + (l_rightXPos >> 5)) << (l_blockShift + 6)) & 0x1FFFFFFF));
+
+                memcpy(&destination[((l_currentXOffset + point->x) << l_blockShift) + l_rowOffset],
+                    (uint8_t*)l_sourceData +
+                    2048 * (l_rightYOffset & 1) +
+                    256 * ((l_rightSwizzledOffset >> 6) & 7) +
+                    32 * (l_rightYOffset & 0xFFFFFFFE) +
+                    8 * (l_rightSwizzledOffset & 0xFFFFFE00) +
+                    (l_rightSwizzledOffset & 0x3F),
+                    (l_rectWidth - l_currentXOffset) << l_blockShift);
+            }
+        }
+    }
+
+    // Free temporary buffer if created
+    if (source == destination)
+        _aligned_free(l_sourceData);
+}
+
+std::vector<uint8_t> UntileX360Surface(
+    uint8_t* tiledInput,
+    uint32_t textureWidth,
+    uint32_t textureHeight,
+    uint32_t outputBlockWidth,
+    uint32_t outputBlockHeight,
+    uint32_t bytesPerTexel,
+    uint32_t sxOffset = 0,
+    uint32_t syOffset = 0
+) {
+    std::vector<uint8_t> output;
+    uint32_t outputPitch = outputBlockWidth * bytesPerTexel;
+    output.resize(outputPitch * outputBlockHeight);
+
+    RECT inputRegion = {
+        static_cast<LONG>(sxOffset),
+        static_cast<LONG>(syOffset),
+        static_cast<LONG>(sxOffset + outputBlockWidth),
+        static_cast<LONG>(syOffset + outputBlockHeight)
+    };
+
+    POINT outputOffset = { 0, 0 };
+
+    UntileSurface(&outputOffset, textureWidth, output.data(), outputPitch, tiledInput,
+        textureHeight, &inputRegion, bytesPerTexel);
+
+    return output;
+}
+
+void readDDS(const std::string& filename) {
+    std::ifstream infile(filename, std::ios::in | std::ios::binary);
+
+    std::vector<uint8_t> textureArray;
+    DirectX::DDS_HEADER header{};
+
+    if (!infile.is_open()) {
+        // cannot open
+    }
+    char magic[4];
+    infile.read(magic, 4);
+    if (strncmp(magic, "DDS ", 4) != 0) {
+        // not dds file
+    }
+
+    // Read DDS header
+    infile.read(reinterpret_cast<char*>(&header), sizeof(DirectX::DDS_HEADER));
+
+    // Validate DDS header and perform additional checks if necessary
+    // ...
+    std::cout << "size:" << header.size << "\n";
+    std::cout << "height:" << header.height << "\n";
+    std::cout << "width:" << header.width << "\n";
+    std::cout << "mipcount:" << header.mipMapCount << "\n";
+
+    const DirectX::DDS_PIXELFORMAT& format = header.ddspf;
+    std::cout << "Pixel Format Size: " << format.size << "\n";
+    std::cout << "Pixel Format Flags: " << format.flags << "\n";
+
+    std::cout << "Format: " << GetDXTEXTUREFORMATName(format) << "\n";
+
+
+    if (format.flags & DDS_FOURCC) {
+        std::cout << "Format: FOURCC (Four Character Code)\n";
+        std::cout << "FourCC: " << std::string(reinterpret_cast<const char*>(&format.fourCC), 4) << "\n";
+    }
+    if (format.flags & DDS_RGB) {
+        std::cout << "Format: RGB\n";
+        std::cout << "RGB Bit Count: " << format.RGBBitCount << "\n";
+        std::cout << "Red Bit Mask: " << std::hex << format.RBitMask << std::dec << "\n";
+        std::cout << "Green Bit Mask: " << std::hex << format.GBitMask << std::dec << "\n";
+        std::cout << "Blue Bit Mask: " << std::hex << format.BBitMask << std::dec << "\n";
+        if (format.flags & DDS_ALPHAPIXELS) {
+            std::cout << "Alpha Bit Mask: " << std::hex << format.ABitMask << std::dec << "\n";
+        }
+    }
+    if (format.flags & DDS_LUMINANCE) {
+        std::cout << "Format: Luminance\n";
+    }
+
+    // Read texture data
+    textureArray.resize(header.size - sizeof(DirectX::DDS_HEADER));
+    infile.read(reinterpret_cast<char*>(textureArray.data()), textureArray.size());
+
+    infile.close();
+}
+
+int unnamedcount = 0;
+
+void writeDDS(std::string filename, std::vector<uint8_t> texturearray, int width, int height, int mipMapLevels, DirectX::DDS_PIXELFORMAT pixelFormat, std::string gpuDimension, int Depth = 0)
+{
+    // Define DDS header using DDS.h structures
+    DirectX::DDS_HEADER header{};
+    header.size = sizeof(DirectX::DDS_HEADER);
+    header.flags = DDS_HEADER_FLAGS_TEXTURE | DDS_HEADER_FLAGS_MIPMAP;
+
+    if (gpuDimension == "GPUDIMENSION_CUBEMAP") {
+        header.flags |= DDS_HEADER_FLAGS_TEXTURE | DDS_HEIGHT; // Add cubemap flag
+        //header.flags |= DDS_HEADER_FLAGS_VOLUME; // Add volume flag
+        header.caps2 = DDS_CUBEMAP_POSITIVEX | DDS_CUBEMAP_NEGATIVEX |
+            DDS_CUBEMAP_POSITIVEY | DDS_CUBEMAP_NEGATIVEY |
+            DDS_CUBEMAP_POSITIVEZ | DDS_CUBEMAP_NEGATIVEZ;
+        //header.depth = Depth;
+    }
+
+    header.height = static_cast<uint32_t>(height);
+    header.width = static_cast<uint32_t>(width);
+    header.pitchOrLinearSize = 0;
+    header.depth = 1;
+    header.mipMapCount = static_cast<uint32_t>(mipMapLevels);
+    header.ddspf = pixelFormat;
+    header.caps = 0x00401008; //enable mips
+
+    // Fix the name
+    filename = filename.substr(0, filename.find('\0'));
+
+    // Create directory to save the files
+    std::string dirPath = "DDS";
+    DIR* dir = opendir(dirPath.c_str());
+    if (dir) {
+        closedir(dir);
+    }
+    else if (ENOENT == errno) {
+        CreateDirectoryA(dirPath.c_str(), NULL);
+    }
+
+    // Check if filename contains backslashes
+    size_t pos = filename.find_first_of('\\');
+    if (pos != std::string::npos) {
+        std::string remainingPath = filename;
+
+        // Iterate over each segment of the path, separated by backslashes
+        while (pos != std::string::npos) {
+            // Extract the current directory name
+            std::string dirName = remainingPath.substr(0, pos);
+
+            // Append the current directory to the directory path
+            dirPath += "\\" + dirName;
+
+            // Create the directory if it does not exist
+            if (!CreateDirectoryA(dirPath.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+                std::cerr << "Failed to create directory: " << GetLastError() << std::endl;
+                return;
+            }
+
+            // Update the remaining path and find the next backslash
+            remainingPath = remainingPath.substr(pos + 1);
+            pos = remainingPath.find_first_of('\\');
+        }
+    }
+
+    // Write DDS file
+    std::string fullFilePath;
+    if (filename == "") {
+        unnamedcount += 1;
+        fullFilePath = "DDS/Unnamed_" + std::to_string(unnamedcount) + ".dds";
+    }
+    else {
+        fullFilePath = "DDS/" + filename + ".dds";
+    }
+
+    std::ofstream outfile(fullFilePath, std::ios::out | std::ios::binary);
+
+    // Write DDS magic number
+    outfile.write("DDS ", 4);
+
+    // Write DDS header
+    outfile.write(reinterpret_cast<const char*>(&header), sizeof(DirectX::DDS_HEADER));
+
+    // Write texture data
+    outfile.write(reinterpret_cast<const char*>(texturearray.data()), texturearray.size());
+
+    outfile.close();
+}
+
+void untile_xbox_textures_and_write_to_DDS(std::string filename, std::vector<uint8_t> src, int width, int height, int mipMapLevels, int PackedMips, int format, int Depth, bool Tiled, std::string gpuDimension) {
+    //untiles mips. :)
+    DirectX::DDS_PIXELFORMAT pixelFormat{};
+    std::string gpuFormat = GetGPUTEXTUREFORMAT(format);
+    pixelFormat = GetDDSTEXTUREFORMAT(format);
+    std::vector<uint8_t> dst;
+
+    int blockSize = 0;
+    int texelPitch = 0;
+    int mipWidth = width;
+    int mipHeight = height;
+    int mipLevelOffset = 0;
+    int tiledWidth = 0;
+    int tiledHeight = 0;
+    int initialmipSize;
+    int tiledmipSize;
+    int mipSize = 0;
+    int syOffset = 0;
+    bool firsttime = true;
+    bool compressed = true;
+
+    GetTextureFormatProperties(gpuFormat, blockSize, texelPitch, compressed);
+
+    if (compressed) {
+        swapEndianArray(src, 2);
+    }
+    else {
+        swapEndianArray(src, texelPitch);
+    }
+
+    //add cubemap stuff
+    int numFaces = gpuDimension == "GPUDIMENSION_CUBEMAP" ? 6 : 1; //if cubemap, have 6 faces.
+    std::vector<std::vector<uint8_t>> textures(numFaces);
+
+    int chunksize = 4096 * texelPitch / blockSize;
+    int smallestmipsize;
+
+    //smallest mip size is calculated based on smallest possible mip arrangement with current aspect ratio aligned to 0x1000.
+    //there is probably better way to calculate smallest size but this works now.
+    double divisor;
+    if (height >= 16 and width >= 16) {
+        divisor = static_cast<double>(min(height, width)) / 16;
+    }
+    else {
+        divisor = static_cast<double>(min(height, width)) / static_cast<double>(min(height, width));
+    }
+    smallestmipsize = Align(static_cast<int>(32 * (static_cast<double>(max(height, width)) / divisor) * texelPitch / blockSize), 4096);
+
+    //std::cout << "w: " << width << " h: " << height << " f: " << format << " " << gpuFormat << " m: " << mipMapLevels << "\n";
+    mipMapLevels += 1; //0 means 1
+
+    if (Tiled) {
+        for (int level = 0; level < mipMapLevels; level++) {
+            int sxOffset = 0;
+            for (int face = 0; face < numFaces; face++) {
+                if (compressed) {
+                    tiledWidth = Align(mipWidth, 128);
+                    tiledHeight = Align(mipHeight, 128);
+                    initialmipSize = max(1, ((mipWidth + 3) / 4)) * max(1, ((mipHeight + 3) / 4)) * texelPitch;
+                    tiledmipSize = max(1, ((tiledWidth + 3) / 4)) * max(1, ((tiledHeight + 3) / 4)) * texelPitch;
+                }
+                else {
+                    tiledWidth = mipWidth;
+                    tiledHeight = mipHeight;
+                    initialmipSize = max(1, mipWidth) * max(1, mipHeight) * texelPitch;
+                    tiledmipSize = Align(initialmipSize, smallestmipsize);
+                }
+                int endoffsetforsrc = mipLevelOffset + tiledmipSize;
+
+                std::vector<uint8_t> mipsrc(src.begin() + mipLevelOffset, src.begin() + endoffsetforsrc);
+
+                int tiledBlockWidth = tiledWidth / blockSize;
+                int originalBlockWidth = max(1, mipWidth / blockSize);
+                int tiledBlockHeight = tiledHeight / blockSize;
+                int originalBlockHeight = max(1, mipHeight / blockSize);
+
+                if (initialmipSize < (32 * 64 * texelPitch) and mipMapLevels > 1) {
+                    //processing smallest mips
+                    if (mipWidth <= 16 or mipHeight <= 16) {
+                        if (width > height) {
+                            //example of this type of scenario
+                            //sxOffset
+                            //    4   8       16              32
+                            //    #   ##      ####            ########                         syOffset
+                            //                                ########                        
+                            //                                                                
+                            //                                                                
+                            //################                                                 4
+                            //################                                                
+                            //################                                                
+                            //################                                                
+                            //################################                                 8
+                            //################################                                
+                            //################################                                
+                            //################################                                
+                            //################################                                
+                            //################################                                
+                            //################################                                
+                            //################################
+                            //                                 
+                            //################################################################ 16\/
+                            if (mipHeight > 2 / max(1, 16 / height)) {
+                                syOffset = originalBlockHeight * max(1, 16 / height);
+                            }
+                            else {
+                                syOffset = 0;
+                                sxOffset = 4 * mipWidth / blockSize;
+                            }
+                        }
+                        else {
+                            //example of this type of scenario
+                            //    4	  8	      >16
+                            //    ############ ################
+                            //    ############ ################
+                            //    ############ ################
+                            //    ############ ################
+                            //#       ######## ################ 4
+                            //        ######## ################
+                            //        ######## ################
+                            //        ######## ################
+                            //##               ################ 8
+                            //##               ################
+                            //                 ################
+                            //                 ################
+                            //                 ################
+                            //                 ################
+                            //                 ################
+                            //                 ################
+                            if (mipWidth > 2 / max(1, 16 / width)) {
+                                sxOffset = originalBlockWidth * max(1, 16 / width);
+                            }
+                            else {
+                                sxOffset = 0;
+                                syOffset = 4 * mipHeight / blockSize;
+                            }
+                        }
+                    }
+                }
+
+                std::vector<uint8_t> mipdst = UntileCompressedXbox360Texture(mipsrc, tiledBlockWidth, originalBlockWidth, tiledBlockHeight,
+                    originalBlockHeight, texelPitch, sxOffset, syOffset);
+
+                //std::vector<uint8_t> mipdst = UntileX360Surface(
+                //    mipsrc.data(), tiledBlockWidth, tiledBlockHeight, originalBlockWidth, originalBlockHeight, texelPitch, sxOffset, syOffset);
+
+                if (mipdst.size() < 0x80) {
+                    mipdst.resize(0x80);
+                }
+
+                textures[face].insert(textures[face].end(), mipdst.begin(), mipdst.begin() + initialmipSize);
+                mipdst.clear();
+
+                if (src.size() > mipLevelOffset + tiledmipSize) {
+                    mipLevelOffset += tiledmipSize;
+                }
+                mipsrc.clear();
+            }
+
+            mipWidth = max(1, mipWidth / 2);
+            mipHeight = max(1, mipHeight / 2);
+        }
+    }
+    else {
+        for (int level = 0; level < mipMapLevels; level++) {
+            for (int face = 0; face < numFaces; face++) {
+                if (compressed) {
+                    initialmipSize = max(1, ((mipWidth + 3) / 4)) * max(1, ((mipHeight + 3) / 4)) * texelPitch;
+                }
+                else {
+                    initialmipSize = max(1, mipWidth) * max(1, mipHeight) * texelPitch;
+                }
+                textures[face].insert(textures[face].end(), src.begin(), src.begin() + initialmipSize);
+            }
+
+            mipWidth = max(1, mipWidth / 2);
+            mipHeight = max(1, mipHeight / 2);
+        }
+    }
+
+    for (int face = 0; face < numFaces; face++) {
+        dst.insert(dst.end(), textures[face].begin(), textures[face].end());
+    }
+
+    writeDDS(filename, dst, width, height, mipMapLevels, pixelFormat, gpuDimension, Depth);
+    dst.clear();
+}
+
+void getTextureInformationAndUntile(std::string name, std::vector<uint8_t>& buffer, unsigned char* GPUTEXTURE, int arraySize) {
+    reverseBytesInArray(GPUTEXTURE, arraySize);
+
+    // DWORD 0
+    bool Tiled = extractValue(GPUTEXTURE, 1, 0);
+    int Pitch = extractValue(GPUTEXTURE, 9, 1);
+    bool Padding = extractValue(GPUTEXTURE, 1, 10);
+    int MultiSample = extractValue(GPUTEXTURE, 2, 11);
+    int ClampZ = extractValue(GPUTEXTURE, 3, 13);
+    int ClampY = extractValue(GPUTEXTURE, 3, 16);
+    int ClampX = extractValue(GPUTEXTURE, 3, 19);
+    int SignW = extractValue(GPUTEXTURE, 2, 22);
+    int SignZ = extractValue(GPUTEXTURE, 2, 24);
+    int SignY = extractValue(GPUTEXTURE, 2, 26);
+    int SignX = extractValue(GPUTEXTURE, 2, 28);
+    int Type = extractValue(GPUTEXTURE, 2, 30);
+
+    // DWORD 1
+    int BaseAddress = extractValue(GPUTEXTURE + 4, 20, 0);
+    bool ClampPolicy = extractValue(GPUTEXTURE + 4, 1, 20);
+    bool Stacked = extractValue(GPUTEXTURE + 4, 1, 21);
+    int RequestSize = extractValue(GPUTEXTURE + 4, 2, 22);
+    int Endian = extractValue(GPUTEXTURE + 4, 2, 24);
+    int DataFormat = extractValue(GPUTEXTURE + 4, 6, 26);
+
+    // DWORD 2
+    int Size = extractValue(GPUTEXTURE + 8, 32, 0);
+    int Width = 0;
+    int Height = 0;
+    int Depth = 0;
+
+    // DWORD 3
+    int BorderSize = extractValue(GPUTEXTURE + 12, 1, 0);
+    int PaddingDword3 = extractValue(GPUTEXTURE + 12, 3, 1);
+    int AnisoFilter = extractValue(GPUTEXTURE + 12, 3, 4);
+    int MipFilter = extractValue(GPUTEXTURE + 12, 2, 7);
+    int MinFilter = extractValue(GPUTEXTURE + 12, 2, 9);
+    int MagFilter = extractValue(GPUTEXTURE + 12, 2, 11);
+    int ExpAdjust = extractValue(GPUTEXTURE + 12, 6, 13);
+    int SwizzleW = extractValue(GPUTEXTURE + 12, 3, 16);
+    int SwizzleZ = extractValue(GPUTEXTURE + 12, 3, 19);
+    int SwizzleY = extractValue(GPUTEXTURE + 12, 3, 22);
+    int SwizzleX = extractValue(GPUTEXTURE + 12, 3, 25);
+    bool NumFormat = extractValue(GPUTEXTURE + 12, 1, 28);
+
+    // DWORD 4
+    int GradExpAdjustV = extractValue(GPUTEXTURE + 16, 5, 0);
+    int GradExpAdjustH = extractValue(GPUTEXTURE + 16, 5, 5);
+    int LODBias = extractValue(GPUTEXTURE + 16, 10, 10);
+    int MinAnisoWalk = extractValue(GPUTEXTURE + 16, 1, 20);
+    int MagAnisoWalk = extractValue(GPUTEXTURE + 16, 1, 21);
+    int MaxMipLevel = extractValue(GPUTEXTURE + 16, 4, 22);
+    int MinMipLevel = extractValue(GPUTEXTURE + 16, 4, 26);
+    int VolMinFilter = extractValue(GPUTEXTURE + 16, 1, 30);
+    int VolMagFilter = extractValue(GPUTEXTURE + 16, 1, 31);
+
+    // DWORD 5
+    int MipAddress = extractValue(GPUTEXTURE + 20, 20, 0);
+    bool PackedMips = extractValue(GPUTEXTURE + 20, 1, 20);
+    int Dimension = extractValue(GPUTEXTURE + 20, 2, 21);
+    int AnisoBias = extractValue(GPUTEXTURE + 20, 4, 23);
+    int TriClamp = extractValue(GPUTEXTURE + 20, 2, 27);
+    bool ForceBCWtoMax = extractValue(GPUTEXTURE + 20, 1, 29);
+    int BorderColor = extractValue(GPUTEXTURE + 20, 2, 30);
+    std::string gpuDimension;
+
+    if (Dimension == 1) { // GPUDIMENSION_2D, TwoD
+        Width = extractDwordValue(Size, 13, 0) + 1;
+        Height = extractDwordValue(Size, 13, 13) + 1;
+        gpuDimension = "GPUDIMENSION_2D";
+    }
+    else if (Dimension == 0) { // GPUDIMENSION_1D, OneD
+        Width = extractDwordValue(Size, 24, 0) + 1;
+        gpuDimension = "GPUDIMENSION_1D";
+    }
+    else if (Dimension == 2) { // GPUDIMENSION_3D, ThreeD
+        Width = extractDwordValue(Size, 11, 0) + 1;
+        Height = extractDwordValue(Size, 11, 11) + 1;
+        Depth = extractDwordValue(Size, 10, 21) + 1;
+        gpuDimension = "GPUDIMENSION_3D";
+    }
+    else if (Dimension == 3) { // GPUDIMENSION_CUBEMAP, Stack
+        Width = extractDwordValue(Size, 13, 0) + 1;
+        Height = extractDwordValue(Size, 13, 13) + 1;
+        Depth = extractDwordValue(Size, 6, 19) + 1;
+        gpuDimension = "GPUDIMENSION_CUBEMAP";
+    }
+
+    int mipMapLevels = MaxMipLevel - MinMipLevel;
+
+    untile_xbox_textures_and_write_to_DDS(name, buffer, Width, Height, mipMapLevels, PackedMips, DataFormat, Depth, Tiled, gpuDimension);
+}
+
+void write_ps3_textures_to_DDS(std::string filename, std::vector<uint8_t> buffer, int curwidth, int curheight, int mipMapLevels, int format, uint32_t storeType) {
+    DirectX::DDS_PIXELFORMAT pixelFormat{};
+    auto ps3It = pixelFormatsPS3.find(format);
+    if (ps3It != pixelFormatsPS3.end()) {
+        pixelFormat = ps3It->second;
+    }
+
+    int texelPitch = 0;
+    bool compressed;
+    if (format == 0x86 or format == 0x81) { //DXT1
+        texelPitch = 8;
+        compressed = true;
+    }
+    else if (format == 0x87 or format == 0x88) { //DXT3, DXT5
+        texelPitch = 16;
+        compressed = true;
+    }
+    else if (format == 0xA5) { //A8R8G8B8
+        texelPitch = 4;
+        compressed = false;
+    }
+    else if (format == 0x85) { //R5G6B5
+        texelPitch = 4;
+        compressed = false;
+    }
+
+    int mipWidth = curwidth;
+    int mipHeight = curheight;
+
+    int textureSize = 0; // calculate texture size to get right offsets for cubemap 
+    for (int level = 0; level < mipMapLevels; level++) {
+        int initialmipSize = 0;
+        if (compressed) {
+            initialmipSize = max(1, ((mipWidth + 3) / 4)) * max(1, ((mipHeight + 3) / 4)) * texelPitch;
+        }
+        else {
+            initialmipSize = max(1, mipWidth) * max(1, mipHeight) * texelPitch;
+        }
+        textureSize += initialmipSize;
+        mipWidth = max(1, mipWidth / 2);
+        mipHeight = max(1, mipHeight / 2);
+    }
+
+    std::string gpuDimension;
+    if (storeType == 2) { // GPUDIMENSION_2D, TwoD
+        gpuDimension = "GPUDIMENSION_2D";
+    }
+    else if (storeType == 1) { // GPUDIMENSION_1D, OneD
+        gpuDimension = "GPUDIMENSION_1D";
+    }
+    else if (storeType == 3) { // GPUDIMENSION_3D, ThreeD
+        gpuDimension = "GPUDIMENSION_3D";
+    }
+    else if (storeType == 0x10002) { // GPUDIMENSION_CUBEMAP, Stack
+        gpuDimension = "GPUDIMENSION_CUBEMAP";
+    }
+
+    if (gpuDimension == "GPUDIMENSION_CUBEMAP") {
+        //calculate position for padding between textures in cubemap textures and remove it.
+        int texAmt = 6; //we assume cubemap always has 6 textures: posx, negx, posy, negy, posz, negz.
+        int leftOverPaddingSize = buffer.size() - textureSize * texAmt;
+        //the last texture won't have padding in the end so we divide by 5 to get padding between each texture.
+        int padAmt = texAmt - 1;
+        int padSize = leftOverPaddingSize / padAmt;
+
+        //removing the padding from the whole data
+        int currentOffset = 0;
+        for (int texture = 0; texture < padAmt; texture++) {
+            // Calculate where the padding starts and ends, taking the offset into account
+            int textureEnd = (texture + 1) * textureSize + currentOffset;
+            int paddingStart = textureEnd;
+            int paddingEnd = paddingStart + padSize;
+
+            // Ensure the indices are within bounds before attempting to erase
+            if (paddingStart >= 0 && paddingEnd <= buffer.size()) {
+                buffer.erase(buffer.begin() + paddingStart, buffer.begin() + paddingEnd);
+                // Update the current offset after removal
+                currentOffset -= padSize;
+            }
+        }
+    }
+
+    writeDDS(filename, buffer, curwidth, curheight, mipMapLevels, pixelFormat, gpuDimension);
+}
+
+enum Type {
+    TYPE_NA = -1,
+    TYPE_2D = 1,
+    TYPE_FORCEENUMSIZEINT = 2147483647,
+};
+
+enum PixelFormat {
+    PIXELFORMAT_NA = 2147483647,
+    PIXELFORMAT_I4 = 1024,
+    PIXELFORMAT_I8 = 2049,
+    PIXELFORMAT_IA4 = 2050,
+    PIXELFORMAT_IA8 = 4099,
+    PIXELFORMAT_RGB565 = 4100,
+    PIXELFORMAT_RGB5A3 = 4101,
+    PIXELFORMAT_RGBA8 = 8198,
+    PIXELFORMAT_CMPR = 1038,
+    PIXELFORMAT_Z8 = 2065,
+    PIXELFORMAT_Z16 = 4115,
+    PIXELFORMAT_Z24X8 = 8214,
+    PIXELFORMAT_R4 = 1056,
+    PIXELFORMAT_RA4 = 2082,
+    PIXELFORMAT_RA8 = 4131,
+    PIXELFORMAT_A8 = 2087,
+    PIXELFORMAT_R8 = 2088,
+    PIXELFORMAT_G8 = 2089,
+    PIXELFORMAT_B8 = 2090,
+    PIXELFORMAT_RG8 = 4139,
+    PIXELFORMAT_RB8 = 4140,
+    PIXELFORMAT_Z4 = 1072,
+    PIXELFORMAT_Z8M = 2105,
+    PIXELFORMAT_Z8L = 2106,
+    PIXELFORMAT_Z16L = 4156,
+    PIXELFORMAT_C4 = 66568,
+    PIXELFORMAT_C8 = 67593,
+    PIXELFORMAT_C14X2 = 69642,
+    PIXELFORMAT_RGB8_Z24 = 0,
+    PIXELFORMAT_RGBA6_Z24 = 1,
+    PIXELFORMAT_RGB565_Z16 = 2,
+    PIXELFORMAT_YCbCr422 = 4351,
+    PIXELFORMAT_DXT1 = 1038,
+    PIXELFORMAT_FORCEENUMSIZEINT = 2147483647,
+};
+
+DirectX::DDS_PIXELFORMAT GetDDSPixelFormat(PixelFormat pf)
+{
+    using namespace DirectX;
+
+    switch (pf)
+    {
+    case PIXELFORMAT_I4:           return DDSPF_L8;
+    case PIXELFORMAT_I8:           return DDSPF_L8;
+    case PIXELFORMAT_IA4:          return DDSPF_A8L8;
+    case PIXELFORMAT_IA8:          return DDSPF_A8L8;
+    case PIXELFORMAT_RGB565:       return DDSPF_R5G6B5;
+    case PIXELFORMAT_RGB5A3:       return DDSPF_A8R8G8B8;
+    case PIXELFORMAT_RGBA8:        return DDSPF_A8R8G8B8;
+    case PIXELFORMAT_DXT1:         return DDSPF_DXT1;
+    case PIXELFORMAT_Z8:           return DDSPF_L8;
+    case PIXELFORMAT_Z16:          return DDSPF_L16;
+    case PIXELFORMAT_Z24X8:        return DDSPF_DX10;
+    case PIXELFORMAT_R4:           return DDSPF_L8;
+    case PIXELFORMAT_RA4:          return DDSPF_A8L8;
+    case PIXELFORMAT_RA8:          return DDSPF_A8L8;
+    case PIXELFORMAT_A8:           return DDSPF_A8;
+    case PIXELFORMAT_R8:           return DDSPF_L8;
+    case PIXELFORMAT_G8:           return DDSPF_L8;
+    case PIXELFORMAT_B8:           return DDSPF_L8;
+    case PIXELFORMAT_RG8:          return DDSPF_A8L8;
+    case PIXELFORMAT_RB8:          return DDSPF_A8L8;
+    case PIXELFORMAT_Z4:           return DDSPF_L8;
+    case PIXELFORMAT_Z8M:          return DDSPF_L8;
+    case PIXELFORMAT_Z8L:          return DDSPF_L8;
+    case PIXELFORMAT_Z16L:         return DDSPF_L16;
+    case PIXELFORMAT_C4:           return DDSPF_L8;
+    case PIXELFORMAT_C8:           return DDSPF_L8;
+    case PIXELFORMAT_C14X2:        return DDSPF_L16;
+    case PIXELFORMAT_RGB8_Z24:     return DDSPF_DX10;
+    case PIXELFORMAT_RGBA6_Z24:    return DDSPF_DX10;
+    case PIXELFORMAT_RGB565_Z16:   return DDSPF_DX10;
+    case PIXELFORMAT_YCbCr422:     return DDSPF_UYVY;
+
+    default:                       return DDSPF_DXT1;
+    }
+}
+
+std::vector<uint8_t> UnswizzleCMPR(const std::vector<uint8_t>& data, int width, int height) {
+    const int Tile_Width = 2;
+    const int Tile_Height = 2;
+    const int DxtBlock_Width = 4;
+    const int DxtBlockSize = 8;
+
+    int numBlockWidth = width / 8;
+    int numBlockHeight = height / 8;
+
+    int tileSize = Tile_Width * Tile_Height * DxtBlockSize;
+    int lineSize = Tile_Width * DxtBlockSize;
+
+    std::vector<uint8_t> untileData(data.size());
+
+    for (int y = 0; y < numBlockHeight; ++y) {
+        for (int x = 0; x < numBlockWidth; ++x) {
+            int dataPtr = (y * numBlockWidth + x) * tileSize;
+            for (int ty = 0; ty < Tile_Height; ++ty) {
+                int curHeight = y * Tile_Height + ty;
+                int dstIndex = (curHeight * numBlockWidth + x) * lineSize;
+                int srcIndex = dataPtr + ty * lineSize;
+                for (int p = 0; p < Tile_Width; ++p) {
+                    untileData[dstIndex + p * DxtBlockSize] = data[srcIndex + p * DxtBlockSize + 1];
+                    untileData[dstIndex + p * DxtBlockSize + 1] = data[srcIndex + p * DxtBlockSize];
+                    untileData[dstIndex + p * DxtBlockSize + 2] = data[srcIndex + p * DxtBlockSize + 3];
+                    untileData[dstIndex + p * DxtBlockSize + 3] = data[srcIndex + p * DxtBlockSize + 2];
+                    for (int i = 4; i < 8; ++i) {
+                        int index = data[srcIndex + p * DxtBlockSize + i];
+                        int swapIndex = (((index >> 6) & 0x3) | (((index >> 4) & 0x3) << 2) | (((index >> 2) & 0x3) << 4) | ((index & 0x3) << 6));
+                        untileData[dstIndex + p * DxtBlockSize + i] = swapIndex;
+                    }
+                }
+            }
+        }
+    }
+
+    return untileData;
+}
+
+// Helper structure for Wii texture format info
+struct WiiTexFormat {
+    int bpp;           // bits per pixel
+    int blockWidth;    // block width in pixels
+    int blockHeight;   // block height in pixels
+    bool isCMPR;       // true if CMPR / DXT1
+    bool hasPalette;   // true if indexed (C4, C8, C14X2)
+};
+
+// Map Wii PixelFormat -> metadata
+WiiTexFormat getWiiFormat(uint32_t format) {
+    switch (format) {
+    case 1024: return { 4, 8, 8, false, false };    // I4
+    case 2049: return { 8, 8, 4, false, false };    // I8
+    case 2050: return { 8, 8, 4, false, false };    // IA4
+    case 4099: return { 16, 4, 4, false, false };   // IA8
+    case 4100: return { 16, 4, 4, false, false };   // RGB565
+    case 4101: return { 16, 4, 4, false, false };   // RGB5A3
+    case 8198: return { 32, 4, 4, false, false };   // RGBA8
+    case 1038: return { 4, 8, 8, true, false };     // CMPR / DXT1
+    case 66568: return { 4, 8, 8, false, true };    // C4
+    case 67593: return { 8, 8, 4, false, true };    // C8
+    case 69642: return { 16, 4, 4, false, true };   // C14X2
+    default:   return { 4, 8, 8, false, false };    // fallback
+    }
+}
+
+// Convert RGB565 -> RGBA8
+inline void decodeRGB565(uint16_t px, uint8_t* dst) {
+    dst[0] = ((px >> 11) & 0x1F) * 255 / 31;   // R
+    dst[1] = ((px >> 5) & 0x3F) * 255 / 63;    // G
+    dst[2] = (px & 0x1F) * 255 / 31;           // B
+    dst[3] = 255;                               // A
+}
+
+// Convert RGB5A3 -> RGBA8
+inline void decodeRGB5A3(uint16_t px, uint8_t* dst) {
+    if (px & 0x8000) { // RGB555
+        dst[0] = ((px >> 10) & 0x1F) * 255 / 31;
+        dst[1] = ((px >> 5) & 0x1F) * 255 / 31;
+        dst[2] = (px & 0x1F) * 255 / 31;
+        dst[3] = 255;
+    }
+    else { // RGB4A3
+        dst[0] = ((px >> 8) & 0x0F) * 255 / 15;
+        dst[1] = ((px >> 4) & 0x0F) * 255 / 15;
+        dst[2] = (px & 0x0F) * 255 / 15;
+        dst[3] = ((px >> 12) & 0x07) * 255 / 7;
+    }
+}
+
+// Unswizzle function
+std::vector<uint8_t> UnswizzleWiiTexture(const std::vector<uint8_t>& data, int width, int height, uint32_t format) {
+    WiiTexFormat fmt = getWiiFormat(format);
+    int bpp = fmt.bpp;
+    int bw = fmt.blockWidth;
+    int bh = fmt.blockHeight;
+    bool isCMPR = fmt.isCMPR;
+    bool hasPalette = fmt.hasPalette;
+    int bytesPerPixel = bpp / 8;
+
+    int blocksX = (width + bw - 1) / bw;
+    int blocksY = (height + bh - 1) / bh;
+
+    std::vector<uint8_t> result(width * height * 4, 0); // always output RGBA8
+
+    int ptr = 0;
+
+    if (isCMPR) {
+        std::vector<uint8_t> untiled = UnswizzleCMPR(data, width, height);
+        result = untiled;
+        return result; // done with DXT1, no need to continue
+    }
+
+    for (int by = 0; by < blocksY; ++by) {
+        for (int bx = 0; bx < blocksX; ++bx) {
+            for (int y = 0; y < bh; ++y) {
+                int yy = by * bh + y;
+                if (yy >= height) break;
+
+                for (int x = 0; x < bw; ++x) {
+                    int xx = bx * bw + x;
+                    if (xx >= width) break;
+
+                    int dstIndex = (yy * width + xx) * 4;
+
+                    if (!hasPalette) {
+                        // Raw pixel
+                        if (bpp == 16) {
+                            uint16_t px = (data[ptr] << 8) | data[ptr + 1];
+                            if (format == 4100) decodeRGB565(px, &result[dstIndex]);
+                            else if (format == 4101) decodeRGB5A3(px, &result[dstIndex]);
+                            ptr += 2;
+                        }
+                        else if (bpp == 32) {
+                            result[dstIndex + 0] = data[ptr + 0];
+                            result[dstIndex + 1] = data[ptr + 1];
+                            result[dstIndex + 2] = data[ptr + 2];
+                            result[dstIndex + 3] = data[ptr + 3];
+                            ptr += 4;
+                        }
+                        else if (bpp == 8) {
+                            uint8_t val = data[ptr++];
+                            result[dstIndex + 0] = val;
+                            result[dstIndex + 1] = val;
+                            result[dstIndex + 2] = val;
+                            result[dstIndex + 3] = 255;
+                        }
+                        else if (bpp == 4) {
+                            uint8_t val = data[ptr / 2];
+                            if (ptr % 2 == 0) val >>= 4;
+                            val &= 0xF;
+                            result[dstIndex + 0] = val * 17;
+                            result[dstIndex + 1] = val * 17;
+                            result[dstIndex + 2] = val * 17;
+                            result[dstIndex + 3] = 255;
+                            ptr++;
+                        }
+                    }
+                    else {
+                        // Indexed formats (C4/C8/C14X2)
+                        // Palette lookup required, implement if needed
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+void unswizzle_wii_textures_and_write_to_DDS(std::string filename, const std::vector<uint8_t>& data, int width, int height, int mipMapLevels, uint32_t format, uint32_t type, uint8_t flags) {
+	PixelFormat pf = static_cast<PixelFormat>(format);
+    DirectX::DDS_PIXELFORMAT pixelFormat = GetDDSPixelFormat(pf);
+	std::cout << "Wii Texture Format: " << pf << "\n";
+    std::vector<uint8_t> unswizzledData = UnswizzleWiiTexture(data, width, height, format);
+    writeDDS(filename, unswizzledData, width, height, mipMapLevels, pixelFormat, "GPUDIMENSION_2D");
+}
